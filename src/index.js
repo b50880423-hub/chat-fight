@@ -529,7 +529,7 @@ async function updateGroupStats(groupId, groupName, groupLink, ctx) {
   const lastChecked = existing?.memberCountCheckedAt ? new Date(existing.memberCountCheckedAt) : null;
   if (!lastChecked || now - lastChecked > 6 * 60 * 60 * 1000) {
     try {
-      memberCount = await ctx.telegram.getChatMembersCount(ctx.chat.id);
+      memberCount = await ctx.telegram.callApi('getChatMemberCount', { chat_id: ctx.chat.id });
     } catch (error) {
       console.warn('[Stats] Could not read member count:', error.message || error);
     }
