@@ -520,21 +520,47 @@ async function applyRule5Block(userId, blockedUntil) {
   }
 }
 
+async function fetchGroupMemberCount(telegram, chatId) {
+  const count = await telegram.callApi('getChatMemberCount', { chat_id: chatId });
+  const numericCount = Number(count);
+  if (!Number.isFinite(numericCount) || numericCount < 0) {
+    throw new Error(`Invalid getChatMemberCount response: ${String(count)}`);
+  }
+  return numericCount;
+}
+
 async function updateGroupStats(groupId, groupName, groupLink, ctx) {
   const database = await connectDb();
   const stats = database.collection('group_stats');
   const now = new Date();
   const existing = await stats.findOne({ groupId });
-  let memberCount = existing?.memberCount || null;
+  // Keep an existing count while Telegram is temporarily unavailable.
+  let memberCount = existing?.memberCount ?? null;
   const lastChecked = existing?.memberCountCheckedAt ? new Date(existing.memberCountCheckedAt) : null;
   if (!lastChecked || now - lastChecked > 6 * 60 * 60 * 1000) {
     try {
-      memberCount = await ctx.telegram.callApi('getChatMemberCount', { chat_id: ctx.chat.id });
+      memberCount = await fetchGroupMemberCount(ctx.telegram, ctx.chat.id);
+      console.log(`[Stats] ${groupId} member count updated: ${memberCount}`);
     } catch (error) {
       console.warn('[Stats] Could not read member count:', error.message || error);
     }
   }
-  await stats.updateOne({ groupId }, { $set: { groupId, groupName, groupLink, memberCount, memberCountCheckedAt: memberCount ? now : existing?.memberCountCheckedAt || null, updatedAt: now }, $setOnInsert: { createdAt: now } }, { upsert: true });
+  await stats.updateOne(
+    { groupId },
+    {
+      $set: {
+        groupId,
+        groupName,
+        groupLink,
+        memberCount,
+        // Mark the refresh time only after Telegram actually returned a count.
+        memberCountCheckedAt: memberCount !== null ? now : existing?.memberCountCheckedAt || null,
+        updatedAt: now,
+      },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true },
+  );
 }
 
 async function getOrCreateUser(groupId, userId, displayName, userName, groupName, groupLink) {
@@ -1430,6 +1456,35 @@ async function start() {
   }
 
   console.log(`[MiniGame] Startup groups scheduled: ${knownGroups.length}`);
+
+  // Refresh member counts for existing groups on every deployment. This also
+  // backfills groups that were tracked before member-count tracking was added.
+  for (const groupId of knownGroups) {
+    try {
+      const sample = await database.collection('group_users').findOne({ groupId });
+      const existingStats = await database.collection('group_stats').findOne({ groupId });
+      const memberCount = await fetchGroupMemberCount(bot.telegram, groupId);
+      const now = new Date();
+      await database.collection('group_stats').updateOne(
+        { groupId },
+        {
+          $set: {
+            groupId,
+            groupName: sample?.groupName || existingStats?.groupName || `Group ${groupId}`,
+            groupLink: sample?.groupLink || existingStats?.groupLink || null,
+            memberCount,
+            memberCountCheckedAt: now,
+            updatedAt: now,
+          },
+          $setOnInsert: { createdAt: now },
+        },
+        { upsert: true },
+      );
+      console.log(`[Stats] Startup member count ${groupId}: ${memberCount}`);
+    } catch (error) {
+      console.warn(`[Stats] Startup member count failed for ${groupId}:`, error.message || error);
+    }
+  }
 
   const runMiniGames = async () => {
     try {

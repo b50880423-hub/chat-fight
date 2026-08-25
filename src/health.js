@@ -55,22 +55,22 @@ export function createHealthServer(getDb) {
           users.aggregate([{ $group:{_id:null,n:{$sum:'$messageCount'}} }]).toArray(),
           users.aggregate([{ $group:{_id:'$groupId'}},{ $count:'n'}]).toArray(),
         ]);
-        const statsDocs = await groupStats.find({ groupId: { $in: groupRows.map(x=>x._id) } }).toArray(); const members = new Map(statsDocs.map(x=>[x.groupId,x.memberCount]));
-        return json(res,{mode,stats:{users:userCount[0]?.n||0,messages:messageAgg[0]?.n||0,groups:groupCount[0]?.n||0},users:userRows.map(x=>({...x,userId:x._id})),groups:groupRows.map(x=>({...x,groupId:x._id,memberCount:members.get(x._id)||null}))});
+        const statsDocs = await groupStats.find({ groupId: { $in: groupRows.map(x=>x._id) } }).toArray(); const members = new Map(statsDocs.map(x=>[String(x.groupId),x.memberCount]));
+        return json(res,{mode,stats:{users:userCount[0]?.n||0,messages:messageAgg[0]?.n||0,groups:groupCount[0]?.n||0},users:userRows.map(x=>({...x,userId:x._id})),groups:groupRows.map(x=>({...x,groupId:x._id,memberCount:members.get(String(x._id)) ?? null}))});
       }
       const groupApiMatch = url.pathname.match(/^\/api\/group\/([^/]+)$/);
       if (req.method === 'GET' && groupApiMatch) {
         const groupId = decodeURIComponent(groupApiMatch[1]); const db = await getDb(); const users = db.collection('group_users'); const groupStats = db.collection('group_stats');
         const mode = ['today','weekly','total'].includes(url.searchParams.get('mode')) ? url.searchParams.get('mode') : 'today'; const {field, match} = modeFields(mode);
-        const base = await users.findOne({ groupId }); if (!base) return json(res,{error:'Group not found'},404);
-        const groupQuery = { ...match, groupId };
+        const base = await users.findOne({ groupId: String(groupId) }); if (!base) return json(res,{error:'Group not found'},404);
+        const groupQuery = { ...match, groupId: String(groupId) };
         const [topUsers, totals, statsDoc, rankRows] = await Promise.all([
           users.aggregate([{ $match:groupQuery },{$sort:{messageCount:-1}},{$limit:100},{$project:{displayName:1,userName:1,userId:1,messageCount:1,dailyMessageCount:1,weeklyMessageCount:1,value:field}}]).toArray(),
           users.aggregate([{ $match:{groupId} },{$group:{_id:null,total:{$sum:'$messageCount'},today:{$sum:{$cond:[{$eq:['$dayKey',getISTDayKey()]},'$dailyMessageCount',0]}},weekly:{$sum:{$cond:[{$eq:['$weekKey',getWeekKey()]},'$weeklyMessageCount',0]}}}}]).toArray(),
-          groupStats.findOne({ groupId }), users.aggregate([{$group:{_id:'$groupId',total:{$sum:'$messageCount'}}},{$sort:{total:-1}}]).toArray(),
+          groupStats.findOne({ groupId: String(groupId) }), users.aggregate([{$group:{_id:'$groupId',total:{$sum:'$messageCount'}}},{$sort:{total:-1}}]).toArray(),
         ]);
-        const rank = rankRows.findIndex(x=>String(x._id)===String(groupId))+1; const activeUsers = await users.countDocuments({ groupId }); const t=totals[0]||{};
-        return json(res,{mode,group:{groupId,groupName:statsDoc?.groupName||base.groupName||'Unknown Group',groupLink:statsDoc?.groupLink||base.groupLink||null,memberCount:statsDoc?.memberCount||null,activeUsers,totalMessages:t.total||0,rank:rank||'-'},activity:{today:t.today||0,weekly:t.weekly||0,total:t.total||0},users:topUsers});
+        const rank = rankRows.findIndex(x=>String(x._id)===String(groupId))+1; const activeUsers = await users.countDocuments({ groupId: String(groupId) }); const t=totals[0]||{};
+        return json(res,{mode,group:{groupId,groupName:statsDoc?.groupName||base.groupName||'Unknown Group',groupLink:statsDoc?.groupLink||base.groupLink||null,memberCount:statsDoc?.memberCount ?? null,activeUsers,totalMessages:t.total||0,rank:rank||'-'},activity:{today:t.today||0,weekly:t.weekly||0,total:t.total||0},users:topUsers});
       }
       const userApiMatch = url.pathname.match(/^\/api\/user\/([^/]+)$/);
       if (req.method === 'GET' && userApiMatch) {
