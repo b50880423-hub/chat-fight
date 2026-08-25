@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { getISTDayKey, getWeekKey } from './rankingLogic.js';
 
 function json(res, data, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -6,9 +7,9 @@ function json(res, data, status = 200) {
 }
 
 function modeFields(mode) {
-  if (mode === 'weekly') return { field: '$weeklyMessageCount', match: {} };
+  if (mode === 'weekly') return { field: '$weeklyMessageCount', match: { weekKey: getWeekKey() } };
   if (mode === 'total') return { field: '$messageCount', match: {} };
-  return { field: '$dailyMessageCount', match: { dayKey: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date()) } };
+  return { field: '$dailyMessageCount', match: { dayKey: getISTDayKey() } };
 }
 
 function pageHtml() {
@@ -25,7 +26,6 @@ export function createHealthServer(getDb) {
         const db = await getDb(); const users = db.collection('group_users'); const groupStats = db.collection('group_stats');
         const mode = ['today','weekly','total'].includes(url.searchParams.get('mode')) ? url.searchParams.get('mode') : 'today';
         const {field, match} = modeFields(mode);
-        if (mode === 'weekly') { const d=new Date(); const day=d.getUTCDay()||7; d.setUTCDate(d.getUTCDate()-(day-1)); match.weekKey=d.toISOString().slice(0,10); }
         const [userRows, groupRows, userCount, messageAgg, groupCount] = await Promise.all([
           users.aggregate([{ $match: match },{ $group:{_id:'$userId',displayName:{$last:'$displayName'},userName:{$last:'$userName'},value:{$sum:field},groupCount:{$sum:1}}},{ $sort:{value:-1}},{ $limit:100}]).toArray(),
           users.aggregate([{ $match: match },{ $group:{_id:'$groupId',groupName:{$last:'$groupName'},value:{$sum:field},activeUsers:{$sum:1}}},{ $sort:{value:-1}},{ $limit:100}]).toArray(),
