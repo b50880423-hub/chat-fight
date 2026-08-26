@@ -79,9 +79,10 @@ export async function generateRankingImage(entries = [], options = {}) {
     const y = rowStart + index * rowHeight;
     const rank = rankSymbols[index] || `${index + 1}.`;
     const rawName = entry[nameKey] || entry.userName || entry.username || entry.groupName || entry.groupId;
+    const genderEmoji = entry.gender === 'male' ? '👨 ' : entry.gender === 'female' ? '👩 ' : entry.gender === 'private' ? '🙈 ' : '';
     const name = nameKey === 'groupName'
       ? imageName(rawName)
-      : imageUsername(entry.userName || entry.username, rawName);
+      : genderEmoji + imageUsername(entry.userName || entry.username, rawName);
     const nameFontSize = fitNameFontSize(name);
     const value = `${formatNumber(entry[valueKey])}${valueSuffix}`;
     const fill = index < 3 ? '#ffffff' : '#e7e9f4';

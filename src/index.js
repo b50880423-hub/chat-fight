@@ -68,6 +68,110 @@ const loggerChatId = getLoggerChatId(process.env);
 const publicGroupLink = process.env.PUBLIC_GROUP_LINK || '';
 const supportChatLink = process.env.SUPPORT_CHAT_LINK || process.env.PUBLIC_GROUP_LINK || '';
 
+
+// ===== Daily funny group summary (free) =====
+// Uses Gemini when GEMINI_API_KEY is configured (free tier can be used),
+// otherwise falls back to a completely local funny summary with no API cost.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+
+function getISTDateKey(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(date);
+}
+
+function getISTTimeParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(date);
+  const map = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+  return { hour: Number(map.hour), minute: Number(map.minute) };
+}
+
+function localFunnySummary(messages) {
+  const counts = new Map();
+  for (const m of messages) counts.set(m.name, (counts.get(m.name) || 0) + 1);
+  const active = [...counts.entries()].sort((a,b) => b[1]-a[1]).slice(0,3).map(([name,count]) => `${name} (${count} msgs)`);
+  const interesting = messages
+    .filter(m => m.text && m.text.length > 8)
+    .sort((a,b) => b.text.length - a.text.length)
+    .slice(0,3)
+    .map(m => `${m.name} ki baat: “${m.text.replace(/\s+/g,' ').slice(0,120)}${m.text.length>120?'…':''}”`);
+  const total = messages.length;
+  return `🌙😂 Aaj ka group officially full entertainment mode mein raha! Total ${total} messages ne group ko busy rakha, aur ${active.length ? active.join(', ') : 'sabhi members'} ne apni presence achhe se feel karayi 😭😂. ${interesting.length ? 'Aaj ke kuch interesting moments mein ' + interesting.join(', aur ') + ' shamil rahe.' : 'Aaj ki conversations kaafi mysterious rahi aur sab log apne-apne secret missions par the 🤣.'} Overall conclusion ye hai ki productivity ka pata nahi, lekin entertainment aur chaos dono full power par the 🔥😂. Good night chaos creators, kal phir naye memes, naye topics aur bilkul unexpected discussions ke saath milte hain! 🌙💀`;
+}
+
+async function generateFunnySummary(messages) {
+  if (!GEMINI_API_KEY) return localFunnySummary(messages);
+  const chat = messages.map(m => `[${m.name}]: ${m.text}`).join('\n').slice(0, 30000);
+  const prompt = `You are summarizing a Telegram group chat. Write ONE funny, warm Hinglish paragraph (not bullet points), 120-220 words. Mention interesting moments and users naturally, lightly roast harmlessly, do not invent facts, do not reveal sensitive/private information, avoid offensive content. Start with 🌙😂 Aaj ka Group Summary: and end with a funny good-night line. Chat:\n${chat}`;
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.9, maxOutputTokens: 450 } })
+    });
+    if (!r.ok) throw new Error(`Gemini HTTP ${r.status}`);
+    const data = await r.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map(p=>p.text).join('').trim();
+    if (text) return text;
+    throw new Error('Empty Gemini response');
+  } catch (error) {
+    console.warn('[Summary] AI failed, using free local summary:', error.message || error);
+    return localFunnySummary(messages);
+  }
+}
+
+async function saveSummaryMessage(groupId, message) {
+  const database = await connectDb();
+  const dayKey = getISTDateKey();
+  const text = cleanUnicode(String(message.text || message.caption || '')).trim();
+  if (!text || text.startsWith('/')) return;
+  const col = database.collection('daily_chat_messages');
+  await col.updateOne(
+    { groupId, dayKey, messageId: message.message_id },
+    { $setOnInsert: { groupId, dayKey, messageId: message.message_id, userId: String(message.from?.id || ''), name: normalizeDisplayName([message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || 'Unknown'), text: text.slice(0, 700), createdAt: new Date() } },
+    { upsert: true }
+  );
+  // Keep storage bounded: only the latest 500 messages per group/day are used.
+  const count = await col.countDocuments({ groupId, dayKey });
+  if (count > 500) {
+    const old = await col.find({ groupId, dayKey }).sort({ createdAt: 1 }).limit(count - 500).project({_id:1}).toArray();
+    if (old.length) await col.deleteMany({ _id: { $in: old.map(x=>x._id) } });
+  }
+}
+
+async function runDailySummaries() {
+  const database = await connectDb();
+  const now = new Date();
+  const { hour, minute } = getISTTimeParts(now);
+  // Run once shortly after midnight IST. A lock prevents duplicate summaries on restarts.
+  if (!(hour === 0 && minute < 5)) return;
+  const prev = new Date(now.valueOf() - 24*60*60*1000);
+  const previousDay = getISTDateKey(prev);
+  const groups = await database.collection('daily_chat_messages').distinct('groupId', { dayKey: previousDay });
+  for (const groupId of groups) {
+    const groupSettings = await database.collection('group_settings').findOne({ groupId: String(groupId) });
+    if (groupSettings?.aiSummaryEnabled === false) continue;
+    const lock = await database.collection('daily_summary_runs').findOneAndUpdate(
+      { groupId, dayKey: previousDay, sent: { $ne: true } },
+      { $setOnInsert: { groupId, dayKey: previousDay, createdAt: now }, $set: { updatedAt: now } },
+      { upsert: true, returnDocument: 'after' }
+    );
+    const already = lock?.sent === true;
+    if (already) continue;
+    const messages = await database.collection('daily_chat_messages').find({ groupId, dayKey: previousDay }).sort({ createdAt: 1 }).limit(500).toArray();
+    if (messages.length < 5) continue;
+    try {
+      const summary = await generateFunnySummary(messages);
+      await bot.telegram.sendMessage(groupId, summary, { disable_web_page_preview: true });
+      await database.collection('daily_summary_runs').updateOne({ groupId, dayKey: previousDay }, { $set: { sent: true, sentAt: new Date() } });
+      console.log(`[Summary] Sent daily summary to ${groupId}`);
+    } catch (error) {
+      console.error(`[Summary] Failed for ${groupId}:`, error.message || error);
+    }
+  }
+}
+
 function addTickToKeyboard(keyboard, activeCallback) {
   if (!keyboard?.inline_keyboard || !activeCallback) return keyboard;
   return {
@@ -402,6 +506,9 @@ async function checkSpamAndCount(ctx) {
   const groupName = ctx.chat?.title || ctx.chat?.username || `Group ${groupId}`;
   const groupLink = ctx.chat?.username ? `https://t.me/${ctx.chat.username}` : null;
 
+  // Save the day's human chat messages for the automatic midnight IST summary.
+  await saveSummaryMessage(groupId, message).catch(error => console.warn('[Summary] Could not save message:', error.message || error));
+
   const { groupStatus } = await getUserStatus(userId, groupId);
   if (isActiveDate(groupStatus?.blockedUntil)) return;
 
@@ -643,80 +750,96 @@ async function getUserProfile(groupId, userId) {
   };
 }
 
+const globalRankingCache = new Map();
+const GLOBAL_RANKING_CACHE_MS = 15000;
+
+function getCachedGlobalRanking(key) {
+  const cached = globalRankingCache.get(key);
+  if (cached && Date.now() - cached.createdAt < GLOBAL_RANKING_CACHE_MS) return cached.value;
+  return null;
+}
+
+function setCachedGlobalRanking(key, value) {
+  globalRankingCache.set(key, { createdAt: Date.now(), value });
+  return value;
+}
+
 async function getGlobalUsers(mode = 'today') {
+  const cacheKey = `users:${mode}`;
+  const cached = getCachedGlobalRanking(cacheKey);
+  if (cached) return cached;
+
   const database = await connectDb();
   const users = database.collection('group_users');
-  const now = new Date();
-  const dayKey = getISTDayKey(now);
-  const weekKey = getWeekKey(now);
-
+  const dayKey = getISTDayKey(new Date());
+  const weekKey = getWeekKey(new Date());
   let match = {};
-  let sortField = 'dailyMessageCount';
   let valueField = '$dailyMessageCount';
+  if (mode === 'weekly') { match = { weekKey }; valueField = '$weeklyMessageCount'; }
+  else if (mode === 'total') { valueField = '$messageCount'; }
+  else { match = { dayKey }; }
 
-  if (mode === 'weekly') {
-    match = { weekKey };
-    sortField = 'weeklyMessageCount';
-    valueField = '$weeklyMessageCount';
-  } else if (mode === 'total') {
-    sortField = 'messageCount';
-    valueField = '$messageCount';
-  } else {
-    match = { dayKey };
-  }
-
-  const entries = await users.aggregate([
+  const [result] = await users.aggregate([
     { $match: match },
-    { $group: { _id: '$userId', userName: { $first: '$userName' }, displayName: { $first: '$displayName' }, value: { $sum: valueField } } },
-    { $sort: { value: -1, displayName: 1, userName: 1 } },
-    { $limit: 10 },
+    { $facet: {
+      top: [
+        { $group: { _id: '$userId', userName: { $first: '$userName' }, displayName: { $first: '$displayName' }, value: { $sum: valueField } } },
+        { $sort: { value: -1, displayName: 1, userName: 1 } },
+        { $limit: 10 },
+      ],
+      totals: [ { $group: { _id: null, total: { $sum: valueField } } } ],
+    } },
   ]).toArray();
 
-  const totalResult = await users.aggregate([
-    { $match: match },
-    { $group: { _id: null, total: { $sum: valueField } } },
-  ]).toArray();
-
-  return entries.map((entry) => ({ ...entry, value: entry.value || 0, totalValue: totalResult[0]?.total || 0 }));
+  const totalValue = result?.totals?.[0]?.total || 0;
+  const top = result?.top || [];
+  const genderDocs = top.length ? await database.collection('user_genders').aggregate([
+    { $match: { userId: { $in: top.map(x => String(x._id)) } } },
+    { $sort: { updatedAt: -1 } },
+    { $group: { _id: '$userId', gender: { $first: '$gender' } } },
+  ]).toArray() : [];
+  const genderMap = new Map(genderDocs.map(x => [String(x._id), x.gender]));
+  const entries = top.map((entry) => ({ ...entry, gender: genderMap.get(String(entry._id)) || null, value: entry.value || 0, totalValue }));
+  return setCachedGlobalRanking(cacheKey, entries);
 }
 
 async function getGlobalGroups(mode = 'today') {
+  const cacheKey = `groups:${mode}`;
+  const cached = getCachedGlobalRanking(cacheKey);
+  if (cached) return cached;
+
   const database = await connectDb();
   const users = database.collection('group_users');
-  const now = new Date();
-  const dayKey = getISTDayKey(now);
-  const weekKey = getWeekKey(now);
-
+  const dayKey = getISTDayKey(new Date());
+  const weekKey = getWeekKey(new Date());
   let match = {};
   let valueField = '$dailyMessageCount';
+  if (mode === 'weekly') { match = { weekKey }; valueField = '$weeklyMessageCount'; }
+  else if (mode === 'total') { valueField = '$messageCount'; }
+  else { match = { dayKey }; }
 
-  if (mode === 'weekly') {
-    match = { weekKey };
-    valueField = '$weeklyMessageCount';
-  } else if (mode === 'total') {
-    valueField = '$messageCount';
-  } else {
-    match = { dayKey };
-  }
-
-  const entries = await users.aggregate([
+  const [result] = await users.aggregate([
     { $match: match },
-    { $group: {
-      _id: '$groupId',
-      groupName: { $first: '$groupName' },
-      groupLink: { $first: '$groupLink' },
-      value: { $sum: valueField },
+    { $facet: {
+      top: [
+        { $group: { _id: '$groupId', groupName: { $first: '$groupName' }, groupLink: { $first: '$groupLink' }, value: { $sum: valueField } } },
+        { $sort: { value: -1, _id: 1 } },
+        { $limit: 10 },
+      ],
+      totals: [ { $group: { _id: null, total: { $sum: valueField } } } ],
     } },
-    { $sort: { value: -1, _id: 1 } },
-    { $limit: 10 },
   ]).toArray();
 
-  const totalResult = await users.aggregate([
-    { $match: match },
-    { $group: { _id: null, total: { $sum: valueField } } },
-  ]).toArray();
-
-  return entries.map((entry) => ({ ...entry, value: entry.value || 0, totalValue: totalResult[0]?.total || 0 }));
+  const totalValue = result?.totals?.[0]?.total || 0;
+  const top = result?.top || [];
+  const genderDocs = top.length ? await database.collection('user_genders').aggregate([
+    { $match: { userId: { $in: top.map(x => String(x._id)) } } },
+    { $sort: { updatedAt: -1 } },
+    { $group: { _id: '$userId', gender: { $first: '$gender' } } },
+  ]).toArray() : [];
+  const genderMap = new Map(genderDocs.map(x => [String(x._id), x.gender]));
+  const entries = top.map((entry) => ({ ...entry, gender: genderMap.get(String(entry._id)) || null, value: entry.value || 0, totalValue }));
+  return setCachedGlobalRanking(cacheKey, entries);
 }
 
 async function getUserTopGroups(userId) {
@@ -1011,10 +1134,96 @@ async function maybeRejectUser(ctx, groupId = null, notify = true) {
   return false;
 }
 
+
+// ===== Group settings: region, mini-games, gender & AI summary =====
+const REGION_CATEGORIES = {
+  'south_asia': { title: '🇮🇳 South Asia', countries: [['🇮🇳 India','India'],['🇳🇵 Nepal','Nepal'],['🇧🇩 Bangladesh','Bangladesh'],['🇵🇰 Pakistan','Pakistan'],['🇱🇰 Sri Lanka','Sri Lanka'],['🇧🇹 Bhutan','Bhutan'],['🇲🇻 Maldives','Maldives'],['🇦🇫 Afghanistan','Afghanistan']] },
+  'east_se_asia': { title: '🌏 East & Southeast Asia', countries: [['🇨🇳 China','China'],['🇯🇵 Japan','Japan'],['🇰🇷 South Korea','South Korea'],['🇲🇳 Mongolia','Mongolia'],['🇮🇩 Indonesia','Indonesia'],['🇲🇾 Malaysia','Malaysia'],['🇸🇬 Singapore','Singapore'],['🇹🇭 Thailand','Thailand'],['🇵🇭 Philippines','Philippines'],['🇻🇳 Vietnam','Vietnam'],['🇲🇲 Myanmar','Myanmar'],['🇰🇭 Cambodia','Cambodia'],['🇱🇦 Laos','Laos'],['🇧🇳 Brunei','Brunei']] },
+  'middle_east': { title: '🕌 Middle East', countries: [['🇦🇪 UAE','UAE'],['🇸🇦 Saudi Arabia','Saudi Arabia'],['🇶🇦 Qatar','Qatar'],['🇰🇼 Kuwait','Kuwait'],['🇴🇲 Oman','Oman'],['🇧🇭 Bahrain','Bahrain'],['🇹🇷 Turkey','Turkey'],['🇮🇷 Iran','Iran'],['🇮🇶 Iraq','Iraq'],['🇯🇴 Jordan','Jordan'],['🇱🇧 Lebanon','Lebanon'],['🇮🇱 Israel','Israel']] },
+  'europe': { title: '🇪🇺 Europe', countries: [['🇬🇧 United Kingdom','United Kingdom'],['🇫🇷 France','France'],['🇩🇪 Germany','Germany'],['🇮🇹 Italy','Italy'],['🇪🇸 Spain','Spain'],['🇵🇹 Portugal','Portugal'],['🇳🇱 Netherlands','Netherlands'],['🇨🇭 Switzerland','Switzerland'],['🇸🇪 Sweden','Sweden'],['🇳🇴 Norway','Norway'],['🇩🇰 Denmark','Denmark'],['🇫🇮 Finland','Finland'],['🇵🇱 Poland','Poland'],['🇺🇦 Ukraine','Ukraine'],['🇷🇺 Russia','Russia'],['🇬🇷 Greece','Greece']] },
+  'north_america': { title: '🇺🇸 North America', countries: [['🇺🇸 United States','United States'],['🇨🇦 Canada','Canada'],['🇲🇽 Mexico','Mexico']] },
+  'south_america': { title: '🇧🇷 South America', countries: [['🇧🇷 Brazil','Brazil'],['🇦🇷 Argentina','Argentina'],['🇨🇴 Colombia','Colombia'],['🇨🇱 Chile','Chile'],['🇵🇪 Peru','Peru']] },
+  'africa': { title: '🌍 Africa', countries: [['🇿🇦 South Africa','South Africa'],['🇳🇬 Nigeria','Nigeria'],['🇪🇬 Egypt','Egypt'],['🇰🇪 Kenya','Kenya'],['🇲🇦 Morocco','Morocco'],['🇬🇭 Ghana','Ghana']] },
+  'oceania': { title: '🇦🇺 Oceania', countries: [['🇦🇺 Australia','Australia'],['🇳🇿 New Zealand','New Zealand']] },
+};
+
+async function isGroupAdmin(ctx) {
+  if (!ctx.chat || ctx.chat.type === 'private') return false;
+  try {
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+    return ['creator', 'administrator'].includes(member.status);
+  } catch { return false; }
+}
+
+async function getGroupSettings(groupId) {
+  const database = await connectDb();
+  const doc = await database.collection('group_settings').findOne({ groupId: String(groupId) });
+  return { groupId: String(groupId), region: '🌐 International', miniGamesEnabled: true, genderEnabled: false, aiSummaryEnabled: true, ...(doc || {}) };
+}
+
+function settingsKeyboard(s) {
+  return { inline_keyboard: [
+    [{ text: '🌍 Region', callback_data: 'settings:region' }, { text: `🎮 Mini Games: ${s.miniGamesEnabled ? 'ON ✅' : 'OFF ❌'}`, callback_data: 'settings:minigames' }],
+    [{ text: `👤 Gender: ${s.genderEnabled ? 'ON ✅' : 'OFF ❌'}`, callback_data: 'settings:gender' }, { text: `🤖 AI Summary: ${s.aiSummaryEnabled ? 'ON ✅' : 'OFF ❌'}`, callback_data: 'settings:summary' }],
+    [{ text: '🔄 Refresh', callback_data: 'settings:home' }],
+  ]};
+}
+function settingsText(s) {
+  return `⚙️ <b>CHATFIGHT GROUP SETTINGS</b>\n\n🌍 <b>Region:</b> ${escapeHtml(s.region || '🌐 International')}\n🎮 <b>Mini Games:</b> ${s.miniGamesEnabled ? 'ON ✅' : 'OFF ❌'}\n👤 <b>Gender System:</b> ${s.genderEnabled ? 'ON ✅' : 'OFF ❌'}\n🤖 <b>Daily AI Summary:</b> ${s.aiSummaryEnabled ? 'ON ✅' : 'OFF ❌'}\n\nChoose an option below 👇`;
+}
+async function editSettings(ctx, text, keyboard) {
+  try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); }
+  catch { await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard }); }
+}
+function regionCategoriesKeyboard() {
+  return { inline_keyboard: [
+    [{text:'🇮🇳 South Asia',callback_data:'regioncat:south_asia'},{text:'🌏 East & Southeast Asia',callback_data:'regioncat:east_se_asia'}],
+    [{text:'🕌 Middle East',callback_data:'regioncat:middle_east'},{text:'🇪🇺 Europe',callback_data:'regioncat:europe'}],
+    [{text:'🇺🇸 North America',callback_data:'regioncat:north_america'},{text:'🇧🇷 South America',callback_data:'regioncat:south_america'}],
+    [{text:'🌍 Africa',callback_data:'regioncat:africa'},{text:'🇦🇺 Oceania',callback_data:'regioncat:oceania'}],
+    [{text:'🌐 International',callback_data:'region:International'}],
+    [{text:'⬅️ Back',callback_data:'settings:home'}]
+  ]};
+}
+function countriesKeyboard(key) {
+  const c=REGION_CATEGORIES[key].countries; const rows=[];
+  for(let i=0;i<c.length;i+=2) rows.push(c.slice(i,i+2).map(([label,name])=>({text:label,callback_data:`region:${name}`})));
+  rows.push([{text:'⬅️ Back',callback_data:'settings:region'}]); return {inline_keyboard:rows};
+}
+
+bot.command('settings', async (ctx) => {
+  if (!await isGroupAdmin(ctx)) return ctx.reply('⚠️ Only group admins can change settings.');
+  const s = await getGroupSettings(ctx.chat.id);
+  await ctx.reply(settingsText(s), { parse_mode:'HTML', reply_markup:settingsKeyboard(s) });
+});
+
+bot.command('gender', async (ctx) => {
+  if (!ctx.chat || ctx.chat.type === 'private') return ctx.reply('Use /gender inside a group.');
+  const s = await getGroupSettings(ctx.chat.id);
+  if (!s.genderEnabled) return ctx.reply('👤 The gender system is currently OFF in this group. Ask an admin to enable it in /settings.');
+  await ctx.reply('👤 <b>Choose your gender (optional):</b>', { parse_mode:'HTML', reply_markup:{inline_keyboard:[
+    [{text:'👨 Male',callback_data:'gender:male'},{text:'👩 Female',callback_data:'gender:female'}],
+    [{text:'🙈 Prefer not to say',callback_data:'gender:private'}]
+  ]}});
+});
+
+bot.action('settings:home', async (ctx) => { await safeAnswerCbQuery(ctx); if (!await isGroupAdmin(ctx)) return; const s=await getGroupSettings(ctx.chat.id); await editSettings(ctx,settingsText(s),settingsKeyboard(s)); });
+bot.action('settings:region', async (ctx) => { await safeAnswerCbQuery(ctx); if (!await isGroupAdmin(ctx)) return; await editSettings(ctx,'🌍 <b>SELECT YOUR GROUP REGION</b>\n\nFirst choose a region category 👇',regionCategoriesKeyboard()); });
+bot.action(/regioncat:(.+)/, async (ctx) => { await safeAnswerCbQuery(ctx); if (!await isGroupAdmin(ctx)) return; const key=ctx.match[1]; if(!REGION_CATEGORIES[key]) return; await editSettings(ctx,`🌍 <b>${REGION_CATEGORIES[key].title}</b>\n\nChoose your country 👇`,countriesKeyboard(key)); });
+bot.action(/region:(.+)/, async (ctx) => { await safeAnswerCbQuery(ctx); if (!await isGroupAdmin(ctx)) return; const region=ctx.match[1]; const database=await connectDb(); await database.collection('group_settings').updateOne({groupId:String(ctx.chat.id)},{$set:{region,updatedAt:new Date()}},{upsert:true}); const s=await getGroupSettings(ctx.chat.id); await ctx.answerCbQuery(`Region updated to ${region}`); await editSettings(ctx,settingsText(s),settingsKeyboard(s)); });
+for (const key of ['minigames','gender','summary']) bot.action(`settings:${key}`, async (ctx) => { await safeAnswerCbQuery(ctx); if (!await isGroupAdmin(ctx)) return; const database=await connectDb(); const s=await getGroupSettings(ctx.chat.id); const field={minigames:'miniGamesEnabled',gender:'genderEnabled',summary:'aiSummaryEnabled'}[key]; const value=!s[field]; await database.collection('group_settings').updateOne({groupId:String(ctx.chat.id)},{$set:{[field]:value,updatedAt:new Date()}},{upsert:true}); if(key==='minigames') await database.collection('mini_game_groups').updateOne({groupId:String(ctx.chat.id)},{$set:{enabled:value,updatedAt:new Date()}},{upsert:true}); const next=await getGroupSettings(ctx.chat.id); await editSettings(ctx,settingsText(next),settingsKeyboard(next)); });
+bot.action(/gender:(male|female|private)/, async (ctx) => { await safeAnswerCbQuery(ctx); const s=await getGroupSettings(ctx.chat.id); if(!s.genderEnabled) return ctx.answerCbQuery('Gender system is OFF.'); const value=ctx.match[1]; const database=await connectDb(); await database.collection('user_genders').updateOne({groupId:String(ctx.chat.id),userId:String(ctx.from.id)},{$set:{gender:value,updatedAt:new Date()},$setOnInsert:{createdAt:new Date()}},{upsert:true}); await ctx.answerCbQuery('Saved!'); await ctx.reply(`✅ Your optional gender setting has been saved as <b>${escapeHtml(value === 'private' ? 'Prefer not to say' : value)}</b>.`,{parse_mode:'HTML'}); });
+
 async function sendRankingReply(ctx, mode = 'today') {
   const groupId = ctx.chat.id.toString();
   const contextName = ctx.chat?.title || ctx.chat?.username || 'this chat';
   const { topUsers, totalValue } = await getTopUsers(groupId, mode);
+  if (topUsers.length) {
+    const database = await connectDb();
+    const genderDocs = await database.collection('user_genders').find({ groupId, userId: { $in: topUsers.map(x => String(x.userId)) } }).toArray();
+    const genderMap = new Map(genderDocs.map(x => [String(x.userId), x.gender]));
+    topUsers.forEach(x => { x.gender = genderMap.get(String(x.userId)) || null; });
+  }
 
   if (!topUsers.length) {
     await sendOrEditMessage(ctx, 'No activity yet in this group.', { reply_markup: buildRankingKeyboard('rankings', `rankings:${mode}`) });
@@ -1386,7 +1595,8 @@ bot.on('message', async (ctx) => {
 
   // Rule 5 runs first so rapid user messages cannot be skipped by another handler.
   await checkSpamAndCount(ctx);
-  await handleMiniGameAnswer({ db: database, ctx });
+  const currentSettings = await getGroupSettings(groupId);
+  if (currentSettings.miniGamesEnabled !== false) await handleMiniGameAnswer({ db: database, ctx });
 });
 
 async function start() {
@@ -1410,9 +1620,10 @@ async function start() {
   const knownGroups = [...new Set([...rankingGroups, ...registeredGroups])];
 
   for (const groupId of knownGroups) {
-    const [sample, registered] = await Promise.all([
+    const [sample, registered, groupSettings] = await Promise.all([
       database.collection('group_users').findOne({ groupId }),
       database.collection('mini_game_groups').findOne({ groupId }),
+      database.collection('group_settings').findOne({ groupId }),
     ]);
 
     await registerMiniGameGroup(
@@ -1422,7 +1633,7 @@ async function start() {
       sample?.groupLink || registered?.groupLink || null
     );
 
-    if (registered?.enabled === false) {
+    if (registered?.enabled === false || groupSettings?.miniGamesEnabled === false) {
       await database.collection('mini_game_groups').updateOne(
         { groupId },
         { $set: { enabled: false, updatedAt: new Date() } },
@@ -1505,6 +1716,11 @@ async function start() {
   setInterval(runMiniGames, 15000);
 
   console.log('[MiniGame] Scheduler started');
+
+  // Check every minute for the automatic 12:00 AM IST group summaries.
+  setInterval(() => runDailySummaries().catch(error => console.error('[Summary] Scheduler error:', error)), 60_000);
+  await runDailySummaries();
+  console.log('[Summary] Midnight IST scheduler started');
 
   await bot.launch();
 

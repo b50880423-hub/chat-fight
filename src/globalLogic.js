@@ -43,7 +43,8 @@ function formatNumber(value = 0) {
 }
 
 function buildUserLink(entry) {
-  const rawName = normalizeDisplayName(entry.displayName || entry.userName || `User ${entry.userId}`);
+  const genderEmoji = entry.gender === 'male' ? '👨 ' : entry.gender === 'female' ? '👩 ' : entry.gender === 'private' ? '🙈 ' : '';
+  const rawName = genderEmoji + normalizeDisplayName(entry.displayName || entry.userName || `User ${entry.userId}`);
   const shortName = limitUnicodeName(rawName, 30);
   const name = escapeHtml(shortName);
   const username = normalizeUsername(entry.userName);
